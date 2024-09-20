@@ -1,9 +1,11 @@
+use memmap::{Mmap, MmapOptions};
 use std::{io::Read, os::unix::fs::FileExt};
 
 use super::{DurabilityError, Durable};
 
 const COLUMN_TYPE_INT: u32 = 1;
 const COLUMN_TYPE_VARCHAR: u32 = 2;
+const MAX_PAGE_SIZE: u64 = 4096;
 
 pub enum ColumnType {
     Int,
@@ -87,6 +89,61 @@ impl Table {
         }
     }
 
+    pub fn page_size(&self) -> u64 {
+        let row_size = self.row_size();
+        if row_size < MAX_PAGE_SIZE {
+            MAX_PAGE_SIZE
+        } else {
+            row_size
+        }
+    }
+
+    pub fn page_count(&self) -> u128 {
+        let row_size = self.row_size() as u128;
+        let page_size = self.page_size() as u128;
+        let row_count = self.row_count;
+
+        row_size * row_count / page_size
+    }
+
+    pub fn add_page(&mut self, file: &mut std::fs::File) -> Result<(), String> {
+        let page_size = self.page_size() as u128;
+        let page_offset: u128 = (self.header_size() as u128) + ((self.page_count()) * page_size);
+
+        let page_offset = page_offset.try_into();
+        if let Err(e) = page_offset {
+            return Err(format!("Error adding page to table: {:?}", e));
+        }
+        let page_offset: u64 = page_offset.unwrap();
+
+        let page = vec![0; page_size as usize];
+        if let Err(e) = file.write_all_at(&page, page_offset.try_into().unwrap()) {
+            return Err(format!("Error adding page to table: {:?}", e));
+        }
+
+        Ok(())
+    }
+
+    pub fn page_at(&self, file: &std::fs::File, page: u64) -> Result<Mmap, String> {
+        if page >= self.page_count() as u64 {
+            return Err("Invalid page number".to_string());
+        }
+        let offset = self.header_size() + (page * self.page_size());
+
+        let mmap = unsafe {
+            MmapOptions::new()
+                .len(self.page_size() as usize)
+                .offset(offset)
+                .map(file)
+        };
+
+        if let Err(e) = mmap {
+            return Err(format!("Error mapping page to memory: {:?}", e));
+        }
+
+        Ok(mmap.unwrap())
+    }
+
     pub fn row_size(&self) -> u64 {
         self.columns
             .iter()
@@ -95,6 +152,14 @@ impl Table {
 
     pub fn header_size(&self) -> u64 {
         68 + (self.column_count as u64 * ColumnDefinition::size()) + 16
+    }
+
+    pub fn last_page_at_limit(&self) -> bool {
+        let row_size = self.row_size() as u128;
+        let page_size = self.page_size() as u128;
+        let row_count = self.row_count;
+
+        (row_size * row_count) % page_size == 0
     }
 
     pub fn add_row(&mut self, row: Row, file: &mut std::fs::File) -> Result<(), String> {
@@ -130,6 +195,11 @@ impl Table {
             ));
         }
 
+        if self.last_page_at_limit() {
+            if self.add_page(file).is_err() {
+                return Err("Error adding page to table".to_string());
+            }
+        }
         if let Err(e) = file.write_all_at(
             &row_bytes,
             self.header_size() + (self.row_size() * self.row_count as u64),
@@ -170,14 +240,11 @@ impl Durable for Table {
         const COLUMN_DEFINITION_OFFSET: u64 = 68;
         let mut offset = COLUMN_DEFINITION_OFFSET;
         for column in &self.columns {
-            let column_type: &ColumnType = &column.column_type;
-            let column_type: u32 = column_type.into();
-            let _ = file.write_all_at(&column.name, offset);
-            offset += 64;
-            let _ = file.write_all_at(&column_type.to_ne_bytes(), offset);
-            offset += 4;
-            let _ = file.write_all_at(&column.length.to_ne_bytes(), offset);
-            offset += 8;
+            let bytes = column.bytes();
+            if let Err(e) = file.write_all_at(&bytes, offset) {
+                return Err(super::DurabilityError::IoError(e));
+            }
+            offset += ColumnDefinition::size();
         }
 
         let _ = self.write_row_count_to_disk(file);
@@ -216,7 +283,6 @@ impl Durable for Table {
                 return Err(super::DurabilityError::IoError(e));
             }
             offset += 4;
-            println!("Column type: {:?}", column_type_buff);
             let column_type = match u32::from_ne_bytes(column_type_buff) {
                 1 => ColumnType::Int,
                 2 => ColumnType::Varchar,
@@ -286,6 +352,9 @@ pub fn create_table(name: String, columns: Vec<ColumnDefinition>) -> Result<(), 
     if let Err(e) = table.write_to_disk(&mut file) {
         return Err(format!("Error creating table: {:?}", e));
     }
+    if table.add_page(&mut file).is_err() {
+        return Err("Error adding page to table".to_string());
+    }
 
     Ok(())
 }
@@ -312,6 +381,9 @@ mod tests {
         );
 
         table.write_to_disk(&mut file).unwrap();
+        if let Err(e) = table.add_page(&mut file) {
+            panic!("Error adding page to table: {:?}", e);
+        }
 
         let table = Table::read_from_disk(&mut file);
 
