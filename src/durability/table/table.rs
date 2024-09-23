@@ -1,65 +1,14 @@
-use memmap::{Mmap, MmapOptions};
-use std::{io::Read, os::unix::fs::FileExt};
+use std::os::unix::fs::FileExt;
 
-use super::{DurabilityError, Durable};
+use memmap::Mmap;
+use memmap::MmapOptions;
 
-const COLUMN_TYPE_INT: u32 = 1;
-const COLUMN_TYPE_VARCHAR: u32 = 2;
+use crate::durability::Durable;
+
+use super::ColumnDefinition;
+use super::ColumnType;
+
 const MAX_PAGE_SIZE: u64 = 4096;
-
-pub enum ColumnType {
-    Int,
-    Varchar,
-}
-
-impl ColumnType {
-    //function that returns the Bytes iterator for the column type
-    pub fn bytes(&self) -> Vec<u8> {
-        let code: u32 = self.into();
-        code.to_ne_bytes().to_vec()
-    }
-}
-
-impl Into<u32> for &ColumnType {
-    fn into(self) -> u32 {
-        match self {
-            ColumnType::Int => COLUMN_TYPE_INT,
-            ColumnType::Varchar => COLUMN_TYPE_VARCHAR,
-        }
-    }
-}
-
-pub struct ColumnDefinition {
-    pub name: [u8; 64],
-    pub column_type: ColumnType,
-    pub length: u64,
-}
-
-impl ColumnDefinition {
-    pub fn new(name: String, column_type: ColumnType, length: u64) -> Self {
-        let name_bytes = name.as_bytes();
-        let mut name_buffer = [0; 64];
-        name_buffer[..name_bytes.len()].copy_from_slice(name_bytes);
-        ColumnDefinition {
-            name: name_buffer,
-            column_type,
-            length,
-        }
-    }
-
-    pub fn size() -> u64 {
-        76
-    }
-
-    pub fn bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![];
-        let column_type = &self.column_type;
-        bytes.extend(self.name.iter());
-        bytes.extend(column_type.bytes().iter());
-        bytes.extend(self.length.to_ne_bytes().iter());
-        bytes
-    }
-}
 
 pub struct Row {
     pub data: Vec<Vec<u8>>,
@@ -70,10 +19,6 @@ pub struct Table {
     pub column_count: u32,
     pub columns: Vec<ColumnDefinition>,
     pub row_count: u128,
-}
-
-pub fn table_exists(name: &str) -> bool {
-    std::path::Path::new(name).exists()
 }
 
 impl Table {
@@ -323,98 +268,5 @@ impl Durable for Table {
             columns,
             row_count,
         })
-    }
-}
-
-pub fn writeable_table_file(name: String) -> Result<std::fs::File, DurabilityError> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(name)
-        .map_err(|e| DurabilityError::IoError(e))?;
-
-    Ok(file)
-}
-
-pub fn create_table(name: String, columns: Vec<ColumnDefinition>) -> Result<(), String> {
-    if table_exists(&name) {
-        return Err(format!("Table {} already exists", name));
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .read(true)
-        .create(true)
-        .open(&name)
-        .unwrap();
-
-    let mut table = Table::new(name, columns);
-    if let Err(e) = table.write_to_disk(&mut file) {
-        return Err(format!("Error creating table: {:?}", e));
-    }
-    if table.add_page(&mut file).is_err() {
-        return Err("Error adding page to table".to_string());
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_write_on_disk() {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create(true)
-            .open("test_table")
-            .unwrap();
-
-        let mut table = Table::new(
-            "test_table".to_string(),
-            vec![
-                ColumnDefinition::new("id".to_string(), ColumnType::Int, 11),
-                ColumnDefinition::new("account_id".to_string(), ColumnType::Int, 11),
-            ],
-        );
-
-        table.write_to_disk(&mut file).unwrap();
-        if let Err(e) = table.add_page(&mut file) {
-            panic!("Error adding page to table: {:?}", e);
-        }
-
-        let table = Table::read_from_disk(&mut file);
-
-        if let Err(e) = table {
-            panic!("Error reading table from disk: {:?}", e);
-        }
-        assert!(table.is_ok());
-
-        let mut table = table.unwrap();
-        assert!(table.column_count == 2);
-
-        //add 3 rows
-        for _ in 0..3 {
-            let row_added = table.add_row(
-                Row {
-                    data: vec!["123".as_bytes().to_vec(), "1".as_bytes().to_vec()],
-                },
-                &mut file,
-            );
-
-            if let Err(e) = row_added {
-                panic!("Error adding row to table: {:?}", e);
-            }
-        }
-
-        let table = Table::read_from_disk(&mut file);
-        if let Err(e) = table {
-            panic!("Error reading table from disk: {:?}", e);
-        }
-        assert!(table.is_ok());
-        let table = table.unwrap();
-        assert!(table.row_count == 3);
     }
 }

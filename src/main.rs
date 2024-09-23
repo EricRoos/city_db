@@ -2,14 +2,14 @@ use durability::{
     table::{
         create_table, table_exists, writeable_table_file, ColumnDefinition, ColumnType, Row, Table,
     },
-    DatabaseConfig, Durable,
+    Durable,
 };
 
 mod durability;
 
 fn main() {
     if !table_exists("account_tble") {
-        let created = create_table(
+        let _created = create_table(
             "account_tbl".to_string(),
             vec![
                 ColumnDefinition::new("id".to_string(), ColumnType::Int, 11),

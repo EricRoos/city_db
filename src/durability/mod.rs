@@ -1,5 +1,3 @@
-use std::{io::Read, os::unix::fs::FileExt};
-
 use database::{DatabaseFile, DatabaseFileHeader};
 
 pub mod database;
@@ -20,13 +18,17 @@ pub enum DurabilityError {
 
 pub struct DatabaseConfig {
     pub name: String,
+    pub file_path: String,
 }
 
-fn database_exists(name: &str) -> bool {
-    std::path::Path::new(name).exists()
+fn database_exists(database: &DatabaseConfig) -> bool {
+    let full_file_path = format!("{}/{}", &database.file_path, &database.name);
+    std::path::Path::new(&full_file_path).exists()
 }
+
 fn write_to_disk(database: &DatabaseConfig) -> Result<(), DurabilityError> {
-    let file = std::fs::File::create(&database.name);
+    let full_file_path = format!("{}/{}", &database.file_path, &database.name);
+    let file = std::fs::File::create(&full_file_path);
     if let Err(e) = file {
         return Err(DurabilityError::IoError(e));
     }
@@ -52,7 +54,7 @@ fn write_to_disk(database: &DatabaseConfig) -> Result<(), DurabilityError> {
 }
 
 pub fn init_db(database: &DatabaseConfig) -> Result<(), DurabilityError> {
-    if database_exists(&database.name) {
+    if database_exists(&database) {
         return Err(DurabilityError::DbError(
             "DatabaseConfig already exists".to_string(),
         ));
@@ -63,15 +65,32 @@ pub fn init_db(database: &DatabaseConfig) -> Result<(), DurabilityError> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
     fn test_init_db() {
         let name = String::from("test");
-        let result = init_db(&DatabaseConfig { name });
-        assert!(result.is_ok());
+        let temp_dir = tempdir();
+        if temp_dir.is_err() {
+            panic!("Error: {:?}", temp_dir.err().unwrap());
+        }
+        let temp_dir = temp_dir.unwrap();
+        let temp_file_path = temp_dir.path().join(&name);
 
-        let mut file = std::fs::File::open("test".to_string()).unwrap();
+        let result = init_db(&DatabaseConfig {
+            name,
+            file_path: temp_dir.path().to_str().unwrap().to_string(),
+        });
+
+        if result.is_err() {
+            panic!("Error: {:?}", result.err().unwrap());
+        }
+
+        let mut file = std::fs::File::open(temp_file_path).unwrap();
         let header = DatabaseFileHeader::read_from_disk(&mut file);
         assert!(header.is_ok());
         let header = header.unwrap();
