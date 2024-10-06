@@ -8,8 +8,9 @@ use crate::durability::Durable;
 use super::ColumnDefinition;
 use super::ColumnType;
 
-const MAX_PAGE_SIZE: u64 = 4096;
+const MAX_PAGE_SIZE: u64 = 128;
 
+#[derive(Debug)]
 pub struct Row {
     pub data: Vec<Vec<u8>>,
 }
@@ -18,7 +19,12 @@ pub struct Table {
     pub name: [u8; 64],
     pub column_count: u32,
     pub columns: Vec<ColumnDefinition>,
-    pub row_count: u128,
+    pub row_count: u64,
+}
+
+pub struct Page {
+    pub data: Mmap,
+    pub page_number: u64,
 }
 
 impl Table {
@@ -37,40 +43,54 @@ impl Table {
     pub fn page_size(&self) -> u64 {
         let row_size = self.row_size();
         if row_size < MAX_PAGE_SIZE {
-            MAX_PAGE_SIZE
+            MAX_PAGE_SIZE - (MAX_PAGE_SIZE % row_size)
         } else {
             row_size
         }
     }
 
-    pub fn page_count(&self) -> u128 {
-        let row_size = self.row_size() as u128;
-        let page_size = self.page_size() as u128;
-        let row_count = self.row_count;
+    pub fn page_data(&self, file: &std::fs::File, page: u64) -> Result<Vec<u8>, String> {
+        let mmap = self.page_at(file, page);
+        if let Err(e) = mmap {
+            return Err(format!("Error getting page data: {:?}", e));
+        }
 
-        row_size * row_count / page_size
+        if let Err(e) = mmap {
+            return Err(format!("Error getting page data: {:?}", e));
+        }
+        let mmap = mmap.unwrap();
+
+        Ok(mmap.data.to_vec())
+    }
+
+    pub fn page_count(&self) -> u64 {
+        let row_size = self.row_size();
+        let page_size = self.page_size();
+        let row_count = self.row_count;
+        if row_count == 0 {
+            return 0;
+        }
+
+        (row_size * row_count / page_size) + 1
     }
 
     pub fn add_page(&mut self, file: &mut std::fs::File) -> Result<(), String> {
-        let page_size = self.page_size() as u128;
-        let page_offset: u128 = (self.header_size() as u128) + ((self.page_count()) * page_size);
-
-        let page_offset = page_offset.try_into();
-        if let Err(e) = page_offset {
-            return Err(format!("Error adding page to table: {:?}", e));
-        }
-        let page_offset: u64 = page_offset.unwrap();
+        let page_size = self.page_size();
+        let page_offset: u64 = match self.row_count == 0 {
+            true => self.header_size(),
+            false => (self.header_size()) + ((self.page_count()) * page_size),
+        };
 
         let page = vec![0; page_size as usize];
-        if let Err(e) = file.write_all_at(&page, page_offset.try_into().unwrap()) {
+        if let Err(e) = file.write_all_at(&page, page_offset.into()) {
             return Err(format!("Error adding page to table: {:?}", e));
         }
 
         Ok(())
     }
 
-    pub fn page_at(&self, file: &std::fs::File, page: u64) -> Result<Mmap, String> {
-        if page >= self.page_count() as u64 {
+    pub fn page_at(&self, file: &std::fs::File, page: u64) -> Result<Page, String> {
+        if page > self.page_count() {
             return Err("Invalid page number".to_string());
         }
         let offset = self.header_size() + (page * self.page_size());
@@ -86,7 +106,48 @@ impl Table {
             return Err(format!("Error mapping page to memory: {:?}", e));
         }
 
-        Ok(mmap.unwrap())
+        if let Err(e) = mmap {
+            return Err(format!("Error mapping page to memory: {:?}", e));
+        }
+        let mmap = mmap.unwrap();
+
+        Ok(Page {
+            data: mmap,
+            page_number: page,
+        })
+    }
+
+    pub fn page_rows(&self, page: &Page) -> Vec<Row> {
+        let mut rows = vec![];
+        let row_size = self.row_size() as usize;
+        let page_size = self.page_size() as usize;
+        let rows_in_page = page_size / row_size;
+
+        let row_count = if self.row_count as usize > rows_in_page {
+            if page.page_number == self.page_count() - 1 {
+                self.row_count as usize % rows_in_page
+            } else {
+                rows_in_page
+            }
+        } else {
+            self.row_count as usize
+        };
+
+        for i in 0..row_count {
+            let row_start = i * row_size;
+            let row_end = row_start + row_size;
+            let row_data = page.data[row_start..row_end].to_vec();
+            let mut row = vec![];
+            let mut j = 0;
+            for column in self.columns.iter() {
+                let column_start = column.length as usize * j;
+                let column_end = column_start + column.length as usize;
+                row.push(row_data[column_start..column_end].to_vec());
+                j += 1;
+            }
+            rows.push(Row { data: row });
+        }
+        rows
     }
 
     pub fn row_size(&self) -> u64 {
@@ -96,12 +157,12 @@ impl Table {
     }
 
     pub fn header_size(&self) -> u64 {
-        68 + (self.column_count as u64 * ColumnDefinition::size()) + 16
+        68 + (self.column_count as u64 * ColumnDefinition::size()) + 8
     }
 
     pub fn last_page_at_limit(&self) -> bool {
-        let row_size = self.row_size() as u128;
-        let page_size = self.page_size() as u128;
+        let row_size = self.row_size();
+        let page_size = self.page_size();
         let row_count = self.row_count;
 
         (row_size * row_count) % page_size == 0
@@ -140,14 +201,13 @@ impl Table {
             ));
         }
 
-        if self.last_page_at_limit() {
-            if self.add_page(file).is_err() {
-                return Err("Error adding page to table".to_string());
-            }
+        if self.last_page_at_limit() && self.add_page(file).is_err() {
+            return Err("Error adding page to table".to_string());
         }
+
         if let Err(e) = file.write_all_at(
             &row_bytes,
-            self.header_size() + (self.row_size() * self.row_count as u64),
+            self.header_size() + (self.row_size() * self.row_count),
         ) {
             return Err(format!("Error writing row to disk: {:?}", e));
         }
@@ -178,9 +238,12 @@ impl Durable for Table {
             return Err(super::DurabilityError::IoError(e));
         }
 
-        if let Err(e) = file.write_all_at(&self.column_count.to_ne_bytes(), 64) {
+        let column_count_bytes = self.column_count.to_ne_bytes();
+        if let Err(e) = file.write_all_at(&column_count_bytes, 64) {
             return Err(super::DurabilityError::IoError(e));
         }
+
+        println!("Column count: {:?}", column_count_bytes);
 
         const COLUMN_DEFINITION_OFFSET: u64 = 68;
         let mut offset = COLUMN_DEFINITION_OFFSET;
@@ -212,6 +275,7 @@ impl Durable for Table {
         }
 
         let column_count = u32::from_ne_bytes(column_count_buff);
+        println!("Column count: {}", column_count);
 
         //read the column definitions
         let mut offset = 68;
@@ -255,11 +319,11 @@ impl Durable for Table {
         }
 
         let row_count = {
-            let mut row_count_buff: [u8; 16] = [0; 16];
+            let mut row_count_buff: [u8; 8] = [0; 8];
             if let Err(e) = file.read_exact_at(&mut row_count_buff, offset) {
                 return Err(super::DurabilityError::IoError(e));
             }
-            u128::from_ne_bytes(row_count_buff)
+            u64::from_ne_bytes(row_count_buff)
         };
 
         Ok(Table {
