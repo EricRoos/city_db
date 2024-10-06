@@ -90,6 +90,7 @@ impl Table {
     }
 
     pub fn page_at(&self, file: &std::fs::File, page: u64) -> Result<Page, String> {
+        println!("Getting page at {} from disk", page);
         if page > self.page_count() {
             return Err("Invalid page number".to_string());
         }

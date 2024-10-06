@@ -1,5 +1,6 @@
 use std::{
     borrow::{Borrow, BorrowMut},
+    collections::HashMap,
     fs::File,
     io::{stdin, BufRead},
     str,
@@ -7,7 +8,8 @@ use std::{
 
 use durability::{
     table::{
-        create_table, table_exists, writeable_table_file, ColumnDefinition, ColumnType, Row, Table,
+        create_table, table_exists, writeable_table_file, ColumnDefinition, ColumnType, Page, Row,
+        Table,
     },
     Durable,
 };
@@ -18,24 +20,16 @@ mod query;
 
 fn stringify_result(row: &Row, column_defifnitions: &Vec<ColumnDefinition>) -> Vec<String> {
     let mut result = Vec::new();
-    for (i, column) in row.data.iter().enumerate() {
-        let column_type = column_defifnitions[i].column_type.borrow();
-        match column_type {
-            ColumnType::Int => {
-                let mut buffer: Vec<u8> = vec![];
-                for byte in column.iter() {
-                    if *byte == 0 {
-                        continue;
-                    }
-                    buffer.push(*byte);
-                }
-                let string = str::from_utf8(&buffer).unwrap();
-                result.push(string.to_string());
+    for column in row.data.iter() {
+        let mut buffer: Vec<u8> = vec![];
+        for byte in column.iter() {
+            if *byte == 0 {
+                continue;
             }
-            _ => {
-                result.push("invalid".to_string());
-            }
+            buffer.push(*byte);
         }
+        let string = str::from_utf8(&buffer).unwrap();
+        result.push(string.to_string());
     }
     result
 }
@@ -46,7 +40,12 @@ struct ResultSet {
     execution_status: u8,
 }
 
-fn get_result_set(table: &Table, file: &File, query: Query) -> ResultSet {
+fn get_result_set(
+    table: &Table,
+    file: &File,
+    query: Query,
+    page_cache: &mut HashMap<String, Page>,
+) -> ResultSet {
     let mut result_rows: Vec<Vec<String>> = Vec::new();
     let start_time = std::time::Instant::now();
     let mut status: u8 = 0;
@@ -54,8 +53,12 @@ fn get_result_set(table: &Table, file: &File, query: Query) -> ResultSet {
         Query::Select(query_source, _scope) => match query_source {
             QuerySource::Table(_) => {
                 for i in 0..table.page_count() {
-                    let page = table.page_at(file, i).unwrap();
-                    let rows = table.page_rows(&page);
+                    page_cache
+                        .entry(i.to_string())
+                        .or_insert_with(|| table.page_at(file, i).unwrap());
+
+                    let page = page_cache.get(&i.to_string()).unwrap();
+                    let rows = table.page_rows(page);
                     for row in rows {
                         let result: Vec<String> = stringify_result(&row, &table.columns);
                         result_rows.push(result);
@@ -97,9 +100,14 @@ fn prep_table(file: &mut File) -> Table {
     table
 }
 
-fn execute_query(query: &String, table: &Table, file: &File) {
+fn execute_query(
+    query: &String,
+    table: &Table,
+    file: &File,
+    page_cache: &mut HashMap<String, Page>,
+) {
     let query: Query = query.into();
-    let result_set = get_result_set(table, file, query);
+    let result_set = get_result_set(table, file, query, page_cache);
     let result_set_size = result_set.rows.len();
     //for row in result_set.rows {
     //    println!("{:?}", row);
@@ -115,6 +123,7 @@ fn main() {
     prep_db();
     let mut file = writeable_table_file("account_tbl".to_string()).unwrap();
     let table = prep_table(&mut file);
+    let mut page_cache: HashMap<String, Page> = HashMap::new();
 
     let mut buf_reader = std::io::BufReader::new(stdin());
     let mut buf = Vec::new();
@@ -124,7 +133,7 @@ fn main() {
             continue;
         }
         let query = str::from_utf8(&buf).unwrap().to_string().trim().to_string();
-        execute_query(&query, &table, &file);
+        execute_query(&query, &table, &file, &mut page_cache);
         buf = Vec::new();
     }
 }

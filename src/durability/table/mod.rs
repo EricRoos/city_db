@@ -6,7 +6,7 @@ mod table;
 
 pub use column_definition::ColumnDefinition;
 pub use column_type::ColumnType;
-pub use table::{Row, Table};
+pub use table::{Page, Row, Table};
 
 pub fn writeable_table_file(name: String) -> Result<std::fs::File, DurabilityError> {
     let file = std::fs::OpenOptions::new()
