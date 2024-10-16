@@ -90,7 +90,6 @@ impl Table {
     }
 
     pub fn page_at(&self, file: &std::fs::File, page: u64) -> Result<Page, String> {
-        println!("Getting page at {} from disk", page);
         if page > self.page_count() {
             return Err("Invalid page number".to_string());
         }
@@ -169,7 +168,7 @@ impl Table {
         (row_size * row_count) % page_size == 0
     }
 
-    pub fn add_row(&mut self, row: Row, file: &mut std::fs::File) -> Result<(), String> {
+    pub fn add_row(&mut self, row: &Row, file: &mut std::fs::File) -> Result<(), String> {
         if row.data.len() != self.column_count as usize {
             return Err(format!(
                 "Invalid row data expected {} columns got {} ",
@@ -276,8 +275,6 @@ impl Durable for Table {
         }
 
         let column_count = u32::from_ne_bytes(column_count_buff);
-        println!("Column count: {}", column_count);
-
         //read the column definitions
         let mut offset = 68;
         let mut columns = vec![];
